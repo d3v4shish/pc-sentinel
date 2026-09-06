@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PC Diagnostics
+Comment=Start local PC Diagnostics monitoring at login
+Exec=pc-diagnostics
+Icon=utilities-system-monitor
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

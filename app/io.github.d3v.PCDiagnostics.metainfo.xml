@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.d3v.PCDiagnostics</id>
+  <name>PC Diagnostics</name>
+  <summary>Inspect local system health, incidents, and forensic evidence</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <url type="homepage">https://github.com/d3v</url>
+  <developer id="io.github.d3v">
+    <name>d3v</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <description>
+    <p>PC Diagnostics correlates local journal evidence with system health probes for systemd-based Linux workstations.</p>
+  </description>
+  <launchable type="desktop-id">io.github.d3v.PCDiagnostics.desktop</launchable>
+  <provides>
+    <binary>pc-diagnostics</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>Monitor</category>
+  </categories>
+</component>

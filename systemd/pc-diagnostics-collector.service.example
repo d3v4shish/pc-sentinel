@@ -1,0 +1,14 @@
+[Unit]
+Description=PC Diagnostics journal event collector
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=pc-diagnostics-collector
+WorkingDirectory=%h
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

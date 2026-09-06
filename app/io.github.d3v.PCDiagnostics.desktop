@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=PC Diagnostics
+Comment=Local system diagnostics and forensic evidence collection
+Exec=pc-diagnostics
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=diagnostics;system;hardware;logs;telemetry;
+StartupNotify=true

@@ -1,0 +1,35 @@
+[Unit]
+Description=PC Diagnostics constrained tuning helper connection
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/pc-diagnostics-tuning-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/sys/devices/system/cpu/cpufreq /var/lib/pc-diagnostics
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=CAP_SYS_ADMIN
+DevicePolicy=closed
+DeviceAllow=/dev/nvidia* rw
+SystemCallArchitectures=native
+TimeoutStartSec=90

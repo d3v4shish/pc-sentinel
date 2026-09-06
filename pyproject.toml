@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pc-diagnostics"
+version = "0.1.0"
+description = "Local GTK system diagnostics, telemetry, and forensic evidence collection"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+pc-diagnostics = "pc_diagnostics:main"
+pc-diagnostics-collector = "pcdiag_collector:main"
+
+[tool.setuptools]
+package-dir = {"" = "app"}
+py-modules = [
+  "pc_diagnostics",
+  "pcdiag_collector",
+  "pcdiag_common",
+  "pcdiag_engine",
+  "pcdiag_helper",
+  "pcdiag_presenters",
+  "pcdiag_tuning_helper",
+]
+
+[tool.setuptools.data-files]
+"share/applications" = ["app/io.github.d3v.PCDiagnostics.desktop"]
+"share/metainfo" = ["app/io.github.d3v.PCDiagnostics.metainfo.xml"]
+"share/xdg/autostart" = ["app/io.github.d3v.PCDiagnostics.autostart.desktop"]
+"share/pc-diagnostics/helpers" = [
+  "app/install-helper.sh",
+  "app/pcdiag_helper.py",
+  "app/pcdiag_tuning_helper.py",
+  "app/pc-diagnostics-helper@.service",
+  "app/pc-diagnostics-helper.socket.in",
+  "app/pc-diagnostics-tuning@.service",
+  "app/pc-diagnostics-tuning.socket.in",
+]
+"share/pc-diagnostics/systemd" = ["systemd/pc-diagnostics-collector.service.example"]
