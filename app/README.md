@@ -33,13 +33,15 @@ Exact ten-second and one-minute telemetry is retained for seven days; compact
 
 - Journal evidence is followed continuously and replayed from the last stored
   timestamp after a follower restart.
-- Health metrics are sampled every 10 seconds. Validated power, voltage,
-  temperature, and GPU telemetry keeps exact ten-second samples for seven days;
-  one-minute samples are retained for seven days and 15-minute rollups for 90
-  days. Hardware faults, restart evidence, kernel failures, and crash evidence
-  are retained for one year.
+- The visible overview samples CPU, memory, swap, and root-disk use directly
+  from `/proc` once per second. These display-only samples are not written to
+  the database. The collector records health metrics every 10 seconds;
+  validated power, voltage, temperature, and GPU telemetry keeps exact
+  ten-second samples for seven days, one-minute samples are retained for seven
+  days, and 15-minute rollups for 90 days. Hardware faults, restart evidence,
+  kernel failures, and crash evidence are retained for one year.
 - The visible incident page refreshes every five seconds. Performance cards
-  refresh every 10 seconds; service and
+  refresh from stored telemetry every 10 seconds; service and
   helper status refresh every 30 seconds.
 - The Forensic cases view keeps a focused case for every retained restart,
   crash, kernel, or hardware-fault investigation, with its surrounding

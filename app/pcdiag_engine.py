@@ -28,7 +28,7 @@ from pcdiag_common import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 HELPER_SOCKET = Path("/run/pc-diagnostics/helper.sock")
 TUNING_SOCKET = Path("/run/pc-diagnostics/tuning.sock")
 
@@ -403,7 +403,8 @@ def connect_v2(path: Path = DB_PATH) -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS notifications (
             fingerprint TEXT PRIMARY KEY,
             last_us INTEGER NOT NULL,
-            total INTEGER NOT NULL DEFAULT 1
+            total INTEGER NOT NULL DEFAULT 1,
+            last_severity TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS forensic_cases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -449,6 +450,9 @@ def connect_v2(path: Path = DB_PATH) -> sqlite3.Connection:
         # bucket boundary as the last known sample so the first fresh sample
         # wins deterministically.
         conn.execute("UPDATE metric_rollups SET last_sample_us=bucket_us WHERE last_sample_us=0")
+    notification_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(notifications)")}
+    if "last_severity" not in notification_columns:
+        conn.execute("ALTER TABLE notifications ADD COLUMN last_severity TEXT NOT NULL DEFAULT ''")
     defaults = {
         "retention_days": str(FORENSIC_RETENTION_DAYS),
         "notification_policy": "errors-warnings",
@@ -637,7 +641,8 @@ def record_incident(
             source=CASE WHEN excluded.last_us>=incidents.last_us THEN excluded.source ELSE incidents.source END,
             unit_name=CASE WHEN excluded.last_us>=incidents.last_us THEN excluded.unit_name ELSE incidents.unit_name END,
             sample_message=CASE WHEN excluded.last_us>=incidents.last_us THEN excluded.sample_message ELSE incidents.sample_message END,
-            status=CASE WHEN excluded.last_us>=incidents.last_us THEN 'open' ELSE incidents.status END
+            status=CASE WHEN excluded.last_us>=incidents.last_us THEN 'open' ELSE incidents.status END,
+            acknowledged=CASE WHEN excluded.last_us>=incidents.last_us THEN 0 ELSE incidents.acknowledged END
         """,
         (
             fingerprint,
@@ -780,6 +785,26 @@ def resolve_incident(conn: sqlite3.Connection, rule_id: str, scope: str = "globa
     changed = result.rowcount > 0
     conn.commit()
     return changed
+
+
+def acknowledge_incident(conn: sqlite3.Connection, incident_id: int, acknowledged: bool = True) -> bool:
+    """Set the local acknowledgement state for an open incident."""
+    result = conn.execute(
+        "UPDATE incidents SET acknowledged=? WHERE id=? AND status='open'",
+        (int(acknowledged), int(incident_id)),
+    )
+    conn.commit()
+    return result.rowcount > 0
+
+
+def resolve_incident_id(conn: sqlite3.Connection, incident_id: int) -> bool:
+    """Mark one open incident resolved without changing collected evidence."""
+    result = conn.execute(
+        "UPDATE incidents SET status='resolved',acknowledged=0 WHERE id=? AND status='open'",
+        (int(incident_id),),
+    )
+    conn.commit()
+    return result.rowcount > 0
 
 
 def ingest_journal_record(
@@ -1225,6 +1250,36 @@ def local_metrics(previous_cpu: tuple[int, int, int] | None = None) -> tuple[dic
         metrics.update(parse_nvidia_metrics(output))
     except (OSError, subprocess.SubprocessError, ValueError):
         pass
+    return metrics, state
+
+
+def live_overview_metrics(previous_cpu: tuple[int, int, int] | None = None) -> tuple[dict[str, float], tuple[int, int, int]]:
+    """Read inexpensive overview values without invoking sensors or GPU tools.
+
+    The GUI uses this once per second while its overview is visible. These
+    values are display-only; durable telemetry remains the collector's
+    ten-second cadence.
+    """
+    parts = [int(value) for value in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
+    idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+    iowait = parts[4] if len(parts) > 4 else 0
+    total = sum(parts)
+    state = (idle, iowait, total)
+    metrics: dict[str, float] = {}
+    if previous_cpu:
+        old_idle, old_iowait, old_total = previous_cpu
+        delta = max(1, total - old_total)
+        metrics["cpu.percent"] = max(0.0, min(100.0, 100 * (1 - (idle - old_idle) / delta)))
+        metrics["cpu.iowait"] = max(0.0, min(100.0, 100 * (iowait - old_iowait) / delta))
+    memory: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, value = line.split(":", 1)
+        memory[key] = int(value.strip().split()[0])
+    metrics["memory.percent"] = 100 * (memory["MemTotal"] - memory["MemAvailable"]) / memory["MemTotal"]
+    metrics["swap.percent"] = 0 if not memory.get("SwapTotal") else 100 * (memory["SwapTotal"] - memory["SwapFree"]) / memory["SwapTotal"]
+    disk = shutil.disk_usage("/")
+    metrics["disk.root.percent"] = 100 * disk.used / disk.total
+    metrics["disk.root.free_gib"] = disk.free / 1073741824
     return metrics, state
 
 

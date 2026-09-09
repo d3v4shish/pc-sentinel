@@ -223,7 +223,7 @@ def parse_journal_json_lines(output: str) -> list[dict[str, Any]]:
     return records
 
 
-UNIT_RE = re.compile(r"^[A-Za-z0-9_.:@\\-]{1,240}\.(?:service|socket|timer|path|target|mount)$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,240}\.(?:service|socket|timer|path|target|mount)$")
 USER_ACTIONS = {
     "restart": "restart",
     "reset-failed": "reset-failed",
@@ -274,7 +274,11 @@ def scan_payload(details: Any, scan_type: str = "") -> dict[str, Any]:
             return {"payload_version": 1, "raw": details}
     if not isinstance(details, dict):
         return {"payload_version": 1, "raw": details}
-    if int(details.get("payload_version", 1)) >= 2:
+    try:
+        payload_version = int(details.get("payload_version", 1))
+    except (TypeError, ValueError):
+        payload_version = 1
+    if payload_version >= 2:
         return details
     result = dict(details)
     result["payload_version"] = 1

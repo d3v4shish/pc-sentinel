@@ -21,12 +21,15 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 from pcdiag_common import APP_ID, APP_NAME, DB_PATH, REPORT_DIR, format_time, run_command, write_private_text
 from pcdiag_engine import (
+    acknowledge_incident,
     connect_v2,
     helper_request,
     incident_change_token,
+    live_overview_metrics,
     open_v2,
     record_tuning_audit,
     redact,
+    resolve_incident_id,
     tuning_request,
 )
 from pcdiag_presenters import (
@@ -52,14 +55,22 @@ CSS = b"""
 .metric-value { font-size: 28px; font-weight: 700; }
 .dim { opacity: .68; }
 .card-pad { padding: 16px; }
-.event-card { padding: 10px 12px; }
-.critical { color: #e01b24; }
-.error { color: #ed5b00; }
-.warning { color: #b58300; }
-.activity { color: @accent_color; }
-.confidence-high { color: #2ec27e; font-weight: 700; }
-.confidence-medium { color: #e5a50a; font-weight: 700; }
-.confidence-low { opacity: .72; font-weight: 700; }
+.event-card {
+    background-color: @card_bg_color;
+    border-radius: 12px;
+    margin: 4px 8px;
+    padding: 10px 12px;
+}
+.severity-critical,
+.severity-error { color: @error_color; }
+.severity-warning,
+.confidence-medium { color: @warning_color; }
+.severity-activity,
+.severity-notice { color: @accent_color; }
+.confidence-high { color: @success_color; font-weight: 700; }
+.confidence-medium,
+.confidence-low { font-weight: 700; }
+.confidence-low { color: @insensitive_fg_color; }
 .monospace { font-family: monospace; }
 """
 
@@ -114,7 +125,7 @@ def clear_list(box: Gtk.ListBox) -> None:
 
 def status_icon(severity: str) -> Gtk.Image:
     image = Gtk.Image.new_from_icon_name(SEVERITY_ICONS.get(severity, "dialog-information-symbolic"))
-    image.add_css_class(severity.lower())
+    image.add_css_class(f"severity-{severity.lower()}")
     return image
 
 
@@ -184,9 +195,9 @@ class EventFeedRow(Gtk.Box):
     def set_record(self, record: dict[str, Any]) -> None:
         severity = str(record.get("severity", "Activity"))
         self.icon.set_from_icon_name(SEVERITY_ICONS.get(severity, "dialog-information-symbolic"))
-        for css in ("critical", "error", "warning", "activity"):
+        for css in ("severity-critical", "severity-error", "severity-warning", "severity-activity", "severity-notice"):
             self.icon.remove_css_class(css)
-        self.icon.add_css_class(severity.lower())
+        self.icon.add_css_class(f"severity-{severity.lower()}")
         self.title.set_text(str(record.get("message") or record.get("title") or "Unknown event"))
         stamp = int(record.get("newest_us") or record.get("occurred_us") or record.get("last_us") or 0)
         tier = "TOP CRITICAL  ·  " if is_top_critical(record) else ""
@@ -258,10 +269,13 @@ class MetricCard(Gtk.Box):
         self.append(self.chart)
 
     def update(self, value: float | None, suffix: str, note: str, history: list[float]) -> None:
+        self.update_live(value, suffix, note)
+        self.chart.set_values(history)
+
+    def update_live(self, value: float | None, suffix: str, note: str) -> None:
         self.value.set_text("—" if value is None else f"{value:.0f}{suffix}")
         self.note.set_text(note)
         self.progress.set_fraction(max(0.0, min(1.0, (value or 0) / 100)))
-        self.chart.set_values(history)
 
 
 class EventInspector(Adw.Dialog):
@@ -270,6 +284,7 @@ class EventInspector(Adw.Dialog):
         self.owner = owner
         self.record = record
         self.timeline_cursor: tuple[int, int] | None = None
+        self.context_request_id = 0
         self.timeline_store = Gio.ListStore.new(RecordObject)
         toolbar = Adw.ToolbarView()
         toolbar.add_top_bar(Adw.HeaderBar())
@@ -367,13 +382,17 @@ class EventInspector(Adw.Dialog):
         return root
 
     def _load_context(self) -> None:
+        self.context_request_id += 1
+        request_id = self.context_request_id
         seconds = (5, 30, 120)[self.context_range.get_selected()]
         self.context_status.set_text("Loading…")
         argv = journal_context_argv(self.record, seconds)
         future = self.owner.executor.submit(run_command, argv, 20)
-        future.add_done_callback(lambda done: GLib.idle_add(self._context_ready, done, argv))
+        future.add_done_callback(lambda done: GLib.idle_add(self._context_ready, done, argv, request_id))
 
-    def _context_ready(self, future: concurrent.futures.Future[str], argv: list[str]) -> bool:
+    def _context_ready(self, future: concurrent.futures.Future[str], argv: list[str], request_id: int) -> bool:
+        if self.owner.closed or request_id != self.context_request_id:
+            return GLib.SOURCE_REMOVE
         try:
             records = parse_journal_json_lines(future.result())
         except Exception as exc:
@@ -410,12 +429,15 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
     def __init__(self, app: Adw.Application):
         super().__init__(application=app, title=APP_NAME, default_width=1380, default_height=880)
         self.app = app
+        self.closed = False
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="pcdiag-ui")
+        self.timeout_ids: list[int] = []
         self.last_token: tuple[int, ...] | None = None
         self.live_cursor: tuple[int, int] | None = None
         self.live_raw: list[dict[str, Any]] = []
         self.scan_tokens: dict[str, tuple[int, int]] = {}
         self.metric_cards: dict[str, MetricCard] = {}
+        self.live_metric_cpu_state: tuple[int, int, int] | None = None
         self.nav_rows: dict[Gtk.ListBoxRow, str] = {}
         self.page_titles: dict[str, str] = {}
         self.expanded_issue_ids: set[int] = set()
@@ -423,13 +445,19 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         self.tuning_state: dict[str, Any] = {}
         self.tuning_gpu_options: list[dict[str, Any]] = []
         self.tuning_refresh_inflight = False
+        self.raw_records: list[dict[str, Any]] = []
+        self.raw_status_summary = ""
+        self.raw_request_id = 0
         self._build_shell()
         self._build_pages()
         self.navigate("overview")
         self.refresh_all()
-        GLib.timeout_add_seconds(5, self._poll)
-        GLib.timeout_add_seconds(10, self._metric_tick)
-        GLib.timeout_add_seconds(30, self._status_tick)
+        self.timeout_ids.extend((
+            GLib.timeout_add_seconds(5, self._poll),
+            GLib.timeout_add(1000, self._live_metric_tick),
+            GLib.timeout_add_seconds(10, self._metric_tick),
+            GLib.timeout_add_seconds(30, self._status_tick),
+        ))
         self.connect("close-request", self._close)
 
     def _build_shell(self) -> None:
@@ -574,7 +602,7 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         filters = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.issue_severity = Gtk.DropDown.new_from_strings(SEVERITIES)
         self.issue_category = Gtk.DropDown.new_from_strings(CATEGORIES)
-        self.issue_status = Gtk.DropDown.new_from_strings(["Open", "All", "Resolved", "Acknowledged"])
+        self.issue_status = Gtk.DropDown.new_from_strings(["Open", "All", "Resolved", "Acknowledged", "Historical"])
         self.issue_search = Gtk.SearchEntry(placeholder_text="Search issues")
         for widget in (self.issue_severity, self.issue_category, self.issue_status, self.issue_search):
             filters.append(widget)
@@ -788,6 +816,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._tuning_state_ready, done))
 
     def _tuning_state_ready(self, future: concurrent.futures.Future[dict[str, Any]]) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         self.tuning_refresh_inflight = False
         try:
             response = future.result()
@@ -936,6 +966,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._tuning_action_ready, done, operation, reason))
 
     def _tuning_action_ready(self, future: concurrent.futures.Future[dict[str, Any]], operation: str, reason: str) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try:
             response = future.result()
         except Exception as exc:
@@ -1025,6 +1057,7 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         controls.append(self.raw_source); controls.append(self.raw_since); controls.append(self.raw_search); controls.append(load)
         root.append(controls)
         self.raw_store = Gio.ListStore.new(RecordObject)
+        self.raw_search.connect("search-changed", lambda *_a: self._render_raw_records())
         root.append(Gtk.ScrolledWindow(child=record_list_view(self.raw_store, self._raw_inspector, compact=True), vexpand=True))
         self.raw_status = label("Select a source and load up to 1,000 entries.", "dim")
         self.raw_status.set_margin_start(12); self.raw_status.set_margin_bottom(10)
@@ -1068,6 +1101,7 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
             f"{tier}{record.get('severity')} · {record.get('category')} · "
             f"Last seen {format_time(int(record.get('last_us', 0)))} · "
             f"{record.get('occurrences', 1)} event(s)"
+            + (" · Acknowledged" if record.get("acknowledged") else "")
         )
         row = Adw.ExpanderRow()
         row.set_use_markup(False)
@@ -1119,6 +1153,24 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         full_details.add_suffix(open_button)
         full_details.set_activatable_widget(open_button)
         row.add_row(full_details)
+
+        if str(record.get("status", "open")) == "open":
+            incident_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            acknowledged = bool(record.get("acknowledged"))
+            acknowledge = Gtk.Button(label="Unacknowledge" if acknowledged else "Acknowledge")
+            acknowledge.set_valign(Gtk.Align.CENTER)
+            acknowledge.connect(
+                "clicked",
+                lambda _button, incident_id=incident_id, value=acknowledged: self._set_incident_acknowledged(incident_id, not value),
+            )
+            resolve = Gtk.Button(label="Mark resolved")
+            resolve.set_valign(Gtk.Align.CENTER)
+            resolve.connect("clicked", lambda _button, value=incident_id: self._resolve_incident(value))
+            incident_actions.append(acknowledge)
+            incident_actions.append(resolve)
+            actions = action_row("Local incident state", "These actions change only the local incident record.")
+            actions.add_suffix(incident_actions)
+            row.add_row(actions)
 
         row.set_expanded(incident_id in self.expanded_issue_ids)
         row.connect("notify::expanded", self._issue_expansion_changed, incident_id)
@@ -1255,6 +1307,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._crash_log_ready, done, Path(path).name))
 
     def _crash_log_ready(self, future: concurrent.futures.Future[dict[str, Any]], title: str) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try:
             response = future.result()
             output = str(response.get("output", ""))
@@ -1272,8 +1326,16 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         args: list[Any] = []
         status_index = self.issue_status.get_selected()
         if status_index != 1:
-            status = ("open", "all", "resolved", "acknowledged")[status_index]
-            where.append("status=?"); args.append(status)
+            status = ("open", "all", "resolved", "acknowledged", "historical")[status_index]
+            if status == "acknowledged":
+                where.append("((status='open' AND acknowledged=1) OR status='acknowledged')")
+                status = ""
+            elif status == "open":
+                where.append("status='open'")
+                status = ""
+            elif status:
+                where.append("status=?")
+                args.append(status)
         severity = SEVERITIES[self.issue_severity.get_selected()]
         category = CATEGORIES[self.issue_category.get_selected()]
         if severity != SEVERITIES[0]: where.append("severity=?"); args.append(severity)
@@ -1296,6 +1358,40 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         clear_list(self.issue_list)
         for row in rows:
             self.issue_list.append(self._expandable_incident_row(dict(row)))
+        if not rows:
+            has_filters = bool(
+                self.issue_search.get_text().strip()
+                or self.issue_severity.get_selected() != 0
+                or self.issue_category.get_selected() != 0
+                or self.issue_status.get_selected() != 0
+            )
+            self.issue_list.append(action_row(
+                "No matching incidents" if has_filters else "No active incidents",
+                "Try a broader filter." if has_filters else "The collector has not recorded an unresolved incident.",
+                "edit-find-symbolic" if has_filters else "emblem-ok-symbolic",
+            ))
+
+    def _set_incident_acknowledged(self, incident_id: int, acknowledged: bool) -> None:
+        try:
+            with open_v2() as conn:
+                changed = acknowledge_incident(conn, incident_id, acknowledged)
+        except sqlite3.Error as exc:
+            self.toast(f"Unable to update incident: {exc}")
+            return
+        if changed:
+            self.toast("Incident acknowledged" if acknowledged else "Incident acknowledgement removed")
+            self._refresh_incidents()
+
+    def _resolve_incident(self, incident_id: int) -> None:
+        try:
+            with open_v2() as conn:
+                changed = resolve_incident_id(conn, incident_id)
+        except sqlite3.Error as exc:
+            self.toast(f"Unable to resolve incident: {exc}")
+            return
+        if changed:
+            self.toast("Incident marked resolved")
+            self._refresh_incidents()
 
     def _refresh_overview_issues(self) -> None:
         try:
@@ -1363,6 +1459,21 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         gpu_limit = last("gpu.power.limit.watts")
         power_note = "NVIDIA telemetry unavailable" if gpu_draw is None else f"{gpu_draw:.0f} W of {(gpu_limit or 0):.0f} W cap"
         self.metric_cards["power"].update(last("gpu.power.percent"), "%", power_note, history.get("gpu.power.percent", []))
+
+    def _refresh_live_overview_metrics(self) -> None:
+        try:
+            metrics, self.live_metric_cpu_state = live_overview_metrics(self.live_metric_cpu_state)
+        except (OSError, ValueError, IndexError, KeyError):
+            return
+        cpu = metrics.get("cpu.percent")
+        if cpu is not None:
+            self.metric_cards["cpu"].update_live(cpu, "%", f"I/O wait {metrics.get('cpu.iowait', 0):.1f}%")
+        self.metric_cards["memory"].update_live(
+            metrics["memory.percent"], "%", f"Swap {metrics['swap.percent']:.0f}%"
+        )
+        self.metric_cards["disk"].update_live(
+            metrics["disk.root.percent"], "%", f"{metrics['disk.root.free_gib']:.1f} GiB free"
+        )
 
     def _refresh_performance(self) -> None:
         seconds = (3600, 21600, 86400)[self.perf_range.get_selected()]
@@ -1576,6 +1687,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._service_done, done))
 
     def _service_done(self, future: concurrent.futures.Future[subprocess.CompletedProcess[str]]) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try:
             result = future.result(); self.toast("Command completed" if result.returncode == 0 else f"Command failed: {(result.stderr or result.stdout).strip()[:180]}")
         except Exception as exc: self.toast(f"Command failed: {exc}")
@@ -1588,6 +1701,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._show_log_dialog, done, f"Logs · {unit}"))
 
     def _show_log_dialog(self, future: concurrent.futures.Future[str], title: str) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try: output = future.result()
         except Exception as exc: output = str(exc)
         self._present_text_dialog(title, output)
@@ -1723,11 +1838,16 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         if not rows: self.boot_list.append(action_row("No indexed boots", "The collector has not indexed journal evidence yet."))
 
     def _load_raw(self) -> None:
+        self.raw_request_id += 1
+        request_id = self.raw_request_id
         source = self.raw_source_names[self.raw_source.get_selected()]
         since = ("-15 minutes", "-1 hour", "-24 hours")[self.raw_since.get_selected()]
         self.raw_status.set_text(f"Loading {source}…")
+        self.raw_records = []
+        self.raw_status_summary = ""
+        self.raw_store.remove_all()
         future = self.executor.submit(self._query_raw_source, source, since)
-        future.add_done_callback(lambda done: GLib.idle_add(self._raw_ready, done))
+        future.add_done_callback(lambda done: GLib.idle_add(self._raw_ready, done, request_id))
 
     @staticmethod
     def _query_raw_source(source: str, since: str) -> tuple[list[dict[str, Any]], str]:
@@ -1748,17 +1868,34 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         records = parse_journal_json_lines(run_command(argv, 25))
         return records, f"{len(records)} parsed entries from {source}"
 
-    def _raw_ready(self, future: concurrent.futures.Future[tuple[list[dict[str, Any]], str]]) -> bool:
+    def _raw_ready(self, future: concurrent.futures.Future[tuple[list[dict[str, Any]], str]], request_id: int) -> bool:
+        if self.closed or request_id != self.raw_request_id:
+            return GLib.SOURCE_REMOVE
         try: records, status = future.result()
         except Exception as exc: self.raw_status.set_text(f"Unable to load logs: {exc}"); return GLib.SOURCE_REMOVE
+        self.raw_records = [dict(item) for item in records]
+        self.raw_status_summary = status
+        self._render_raw_records()
+        return GLib.SOURCE_REMOVE
+
+    def _render_raw_records(self) -> None:
         search = self.raw_search.get_text().strip().lower()
-        if search: records = [item for item in records if search in item["message"].lower() or search in item["source"].lower()]
+        records = self.raw_records
+        if search:
+            records = [
+                item for item in records
+                if search in str(item.get("message", "")).lower()
+                or search in str(item.get("source", "")).lower()
+            ]
         self.raw_store.remove_all()
-        for record in records:
+        for original in records:
+            record = dict(original)
             record.update(severity={0: "Critical", 1: "Critical", 2: "Critical", 3: "Error", 4: "Warning"}.get(record["priority"], "Activity"), category="Journal", rule_id="generic")
             self.raw_store.append(RecordObject(record))
-        self.raw_status.set_text(f"{status} · select an entry for metadata and context")
-        return GLib.SOURCE_REMOVE
+        if search:
+            self.raw_status.set_text(f"{len(records)} matching entries · clear the filter to show all loaded messages")
+        elif self.raw_status_summary:
+            self.raw_status.set_text(f"{self.raw_status_summary} · select an entry for metadata and context")
 
     def _status_probe(self) -> tuple[bool, bool, bool, str]:
         collector = run_command(["systemctl", "--user", "is-active", "pc-diagnostics-collector.service"], 3).strip() == "active"
@@ -1773,6 +1910,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._status_ready, done))
 
     def _status_ready(self, future: concurrent.futures.Future[tuple[bool, bool, bool, str]]) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try: collector, helper, database, message = future.result()
         except Exception as exc: collector, helper, database, message = False, False, False, str(exc)
         self.collector_row.set_title("Collector live" if collector else "Collector offline")
@@ -1799,6 +1938,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         self._refresh_status(); self.refresh_page(self.stack.get_visible_child_name() or "overview")
 
     def _poll(self) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try:
             with open_v2(readonly=True) as conn: token = incident_change_token(conn)
         except sqlite3.Error: return GLib.SOURCE_CONTINUE
@@ -1813,13 +1954,24 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_CONTINUE
 
     def _metric_tick(self) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         visible = self.stack.get_visible_child_name() or "overview"
         if visible == "overview": self._refresh_metrics()
         elif visible == "performance": self._refresh_performance()
         elif visible == "power": self._refresh_power()
         return GLib.SOURCE_CONTINUE
 
+    def _live_metric_tick(self) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
+        if (self.stack.get_visible_child_name() or "overview") == "overview":
+            self._refresh_live_overview_metrics()
+        return GLib.SOURCE_CONTINUE
+
     def _status_tick(self) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         self._refresh_status(); return GLib.SOURCE_CONTINUE
 
     def _export_report(self) -> None:
@@ -1827,7 +1979,8 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         future.add_done_callback(lambda done: GLib.idle_add(self._report_ready, done))
 
     def _make_report(self) -> Path:
-        path = REPORT_DIR / time.strftime("pc-diagnostics-%Y%m%d-%H%M%S-redacted.txt")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = REPORT_DIR / f"pc-diagnostics-{stamp}-{time.time_ns() % 1_000_000_000:09d}-redacted.txt"
         with open_v2(readonly=True) as conn:
             incidents = conn.execute("SELECT * FROM incidents ORDER BY last_us DESC LIMIT 1000").fetchall()
             scans = conn.execute("SELECT s.* FROM scans s JOIN (SELECT scan_type,MAX(finished_us) latest FROM scans GROUP BY scan_type) x ON x.scan_type=s.scan_type AND x.latest=s.finished_us").fetchall()
@@ -1836,12 +1989,20 @@ class DiagnosticsWindow(Adw.ApplicationWindow):
         write_private_text(path, redact(text)); return path
 
     def _report_ready(self, future: concurrent.futures.Future[Path]) -> bool:
+        if self.closed:
+            return GLib.SOURCE_REMOVE
         try: self.toast(f"Redacted report saved to {future.result()}")
         except Exception as exc: self.toast(f"Report failed: {exc}")
         return GLib.SOURCE_REMOVE
 
     def _close(self, _window: Gtk.Window) -> bool:
+        self.closed = True
+        for source_id in self.timeout_ids:
+            GLib.source_remove(source_id)
+        self.timeout_ids.clear()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        if self.app.window is self:
+            self.app.window = None
         return False
 
 
@@ -1849,9 +2010,12 @@ class DiagnosticsApplication(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.window: DiagnosticsWindow | None = None
+        self.css_loaded = False
 
     def do_activate(self) -> None:
-        add_css()
+        if not self.css_loaded:
+            add_css()
+            self.css_loaded = True
         with open_v2():
             pass
         if not self.window:

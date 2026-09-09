@@ -38,6 +38,7 @@ from pcdiag_engine import (
     record_tuning_audit,
     reconcile_forensic_cases,
     resolve_incident,
+    SEVERITY_RANK,
     tuning_request,
     update_metric,
     validated_sensors,
@@ -439,31 +440,51 @@ class Collector:
             return
         now = int(time.time() * 1_000_000)
         previous = conn.execute(
-            "SELECT last_us,total FROM notifications WHERE fingerprint=?", (row["fingerprint"],)
+            "SELECT last_us,total,last_severity FROM notifications WHERE fingerprint=?", (row["fingerprint"],)
         ).fetchone()
-        if previous and now - int(previous[0]) < 30 * 60 * 1_000_000:
+        escalated = bool(
+            previous
+            and SEVERITY_RANK.get(str(row["severity"]), 0) > SEVERITY_RANK.get(str(previous[2] or ""), -1)
+        )
+        if previous and not escalated and now - int(previous[0]) < 30 * 60 * 1_000_000:
             return
         recent = conn.execute(
             "SELECT COUNT(*) FROM notifications WHERE last_us>=?",
             (now - 10 * 60 * 1_000_000,),
         ).fetchone()[0]
-        if recent >= 6 and row["severity"] != "Critical":
+        if recent >= 6 and row["severity"] != "Critical" and not escalated:
             return
         urgency = "critical" if row["severity"] in ("Error", "Critical") else "normal"
+        fingerprint = str(row["fingerprint"])
+        command = [
+            "notify-send",
+            "--app-name=PC Diagnostics",
+            "--icon=utilities-system-monitor",
+            "-u",
+            urgency,
+            "-h",
+            f"string:x-canonical-private-synchronous:pc-diagnostics-{fingerprint[:16]}",
+            f"PC Diagnostics · {row['severity']}",
+            f"{row['title']}\n{str(row['sample_message'])[:240]}",
+        ]
         try:
-            subprocess.Popen(
-                ["notify-send", "-u", urgency, f"PC Diagnostics · {row['severity']}", row["title"]],
+            result = subprocess.run(
+                command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
             )
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
             # Notifications are optional.  Evidence and the incident state must
             # still be durable when a desktop notification service is absent.
-            pass
+            return
+        if result.returncode != 0:
+            return
         conn.execute(
-            "INSERT INTO notifications(fingerprint,last_us,total) VALUES(?,?,1) "
-            "ON CONFLICT(fingerprint) DO UPDATE SET last_us=excluded.last_us,total=notifications.total+1",
-            (row["fingerprint"], now),
+            "INSERT INTO notifications(fingerprint,last_us,total,last_severity) VALUES(?,?,1,?) "
+            "ON CONFLICT(fingerprint) DO UPDATE SET last_us=excluded.last_us,total=notifications.total+1,last_severity=excluded.last_severity",
+            (fingerprint, now, row["severity"]),
         )
         conn.commit()
 
@@ -674,6 +695,10 @@ class Collector:
                     scope=f"{interface}:{counter}",
                     details={"previous": previous, "current": value},
                 )
+            elif previous > value:
+                interface = metric.split(".")[1]
+                counter = metric.rsplit(".", 1)[-1]
+                resolve_incident(self.conn, "network-errors", f"{interface}:{counter}")
             self.previous_network[metric] = value
 
     def scan_failed_services(self) -> None:
@@ -762,19 +787,21 @@ class Collector:
                 f"Crash storage contains {len(kernel_sessions)} kernel crash record(s), including "
                 f"{len(incomplete)} incomplete dump(s). Newest dump: {newest_label}."
             )
-            previous = self.conn.execute(
-                "SELECT last_us FROM notifications WHERE fingerprint=?",
-                (fingerprint_for("kernel-crash-artifact", "global"),),
-            ).fetchone()
+            snapshot_key = "\n".join(
+                sorted(
+                    f"{item.get('path', '')}\0{item.get('mtime', 0)}\0{item.get('size', 0)}"
+                    for item in kernel_entries
+                )
+            )
             self.synthetic_issue(
                 "kernel-crash-artifact", "Critical", "Kernel", kernel_title, kernel_summary,
                 "kdump or the kernel crash handler preserved evidence from one or more whole-system kernel failures.",
                 "Each record represents a previous system-wide crash; incomplete dumps may limit root-cause analysis and consume substantial disk space.",
                 ("Inspect the newest dmesg/vmcore pair first.", "Preserve a copy before deleting crash artifacts.", "Correlate the crash time with firmware, driver, memory, and hardware errors."),
                 details={"sessions": sorted(kernel_sessions), "incomplete": len(incomplete), "total_bytes": total},
-                observation_key="\n".join(sorted(kernel_sessions)),
+                observation_key=snapshot_key,
                 occurred_us=newest_kernel_us,
-                notify=not previous or newest_kernel_us > int(previous[0]),
+                notify=not historical,
             )
             self.conn.execute(
                 "UPDATE incidents SET status=? WHERE fingerprint=?",
@@ -784,20 +811,20 @@ class Collector:
         else:
             resolve_incident(self.conn, "kernel-crash-artifact")
         if status == "warning":
-            artifact_paths = sorted(str(item.get("path", "")) for item in entries)
-            previous = self.conn.execute(
-                "SELECT last_us FROM notifications WHERE fingerprint=?",
-                (fingerprint_for("crash-storage", "global"),),
-            ).fetchone()
+            snapshot_key = "\n".join(
+                sorted(
+                    f"{item.get('path', '')}\0{item.get('mtime', 0)}\0{item.get('size', 0)}"
+                    for item in entries
+                )
+            )
             self.synthetic_issue(
                 "crash-storage", "Warning", "Crashes", "Crash dumps require attention", summary,
                 "Kernel or application crashes created large or incomplete diagnostic dumps.",
                 "Crash artifacts consume disk space and indicate previous instability.",
                 ("Review crash dates and metadata in the Crashes page.", "Delete dumps only after preserving any evidence you need."),
                 details={"total_bytes": total, "incomplete": len(incomplete)},
-                observation_key="\n".join(artifact_paths),
+                observation_key=snapshot_key,
                 occurred_us=newest_entry_us,
-                notify=not previous or newest_entry_us > int(previous[0]),
             )
         else:
             resolve_incident(self.conn, "crash-storage")

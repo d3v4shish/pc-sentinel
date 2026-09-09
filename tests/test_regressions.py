@@ -9,9 +9,12 @@ from __future__ import annotations
 from contextlib import nullcontext
 import json
 import stat
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,17 +25,20 @@ sys.path.insert(0, str(ROOT / "app"))
 import pcdiag_helper as helper
 import pcdiag_tuning_helper as tuning
 from pcdiag_collector import Collector
-from pcdiag_presenters import fetch_event_page, fetch_incident_evidence
+from pcdiag_presenters import fetch_event_page, fetch_incident_evidence, scan_payload, service_action_argv
 from pcdiag_common import write_private_text
 from pcdiag_engine import (
+    acknowledge_incident,
     connect_v2,
     ingest_journal_record,
     journal_timestamp_us,
+    live_overview_metrics,
     parse_nvidia_metrics,
     parse_power_sensor_data,
     parse_sensor_data,
     record_incident,
     redact,
+    resolve_incident_id,
     update_metric,
 )
 
@@ -61,6 +67,25 @@ class _Process:
 
 
 class RegressionTests(unittest.TestCase):
+    def test_live_overview_metrics_uses_a_cpu_delta_without_persisting_samples(self) -> None:
+        reads = iter((
+            "cpu  100 0 0 100 0 0 0 0 0 0\n",
+            "MemTotal:       1000 kB\nMemAvailable:    250 kB\nSwapTotal:        200 kB\nSwapFree:         100 kB\n",
+            "cpu  130 0 0 110 10 0 0 0 0 0\n",
+            "MemTotal:       1000 kB\nMemAvailable:    250 kB\nSwapTotal:        200 kB\nSwapFree:         100 kB\n",
+        ))
+        disk = SimpleNamespace(total=1_000, used=250, free=750)
+        with patch("pcdiag_engine.Path.read_text", side_effect=lambda *_args, **_kwargs: next(reads)), \
+             patch("pcdiag_engine.shutil.disk_usage", return_value=disk):
+            first, state = live_overview_metrics()
+            second, _state = live_overview_metrics(state)
+        self.assertNotIn("cpu.percent", first)
+        self.assertEqual(second["cpu.percent"], 60.0)
+        self.assertEqual(second["cpu.iowait"], 20.0)
+        self.assertEqual(second["memory.percent"], 75.0)
+        self.assertEqual(second["swap.percent"], 50.0)
+        self.assertEqual(second["disk.root.percent"], 25.0)
+
     def test_malformed_journal_timestamps_are_stored_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             conn = connect_v2(Path(directory) / "events.sqlite3")
@@ -191,6 +216,100 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(tuple(metric), (90.0, newest, 2))
             conn.close()
 
+    def test_incident_acknowledgement_and_resolution_are_local_and_reopen_on_new_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect_v2(Path(directory) / "events.sqlite3")
+            common = {
+                "rule_id": "state-test", "severity": "Warning", "category": "System",
+                "title": "State test", "summary": "State test", "likely_cause": "test",
+                "impact": "test", "remediation": (), "priority": 4, "unit": "test.service",
+                "details": {}, "scope": "global", "source": "test", "boot_id": "test-boot",
+            }
+            incident_id, created = record_incident(conn, **common, occurred_us=1_000, cursor="state-1", message="first")
+            self.assertTrue(created)
+            self.assertTrue(acknowledge_incident(conn, incident_id))
+            state = conn.execute("SELECT status,acknowledged FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            self.assertEqual(tuple(state), ("open", 1))
+
+            record_incident(conn, **common, occurred_us=2_000, cursor="state-2", message="new evidence")
+            state = conn.execute("SELECT status,acknowledged FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            self.assertEqual(tuple(state), ("open", 0))
+            self.assertTrue(resolve_incident_id(conn, incident_id))
+            state = conn.execute("SELECT status,acknowledged FROM incidents WHERE id=?", (incident_id,)).fetchone()
+            self.assertEqual(tuple(state), ("resolved", 0))
+            conn.close()
+
+    def test_notifications_are_deduplicated_failed_delivery_is_not_recorded_and_escalation_bypasses_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = Collector(Path(directory) / "events.sqlite3", once=True)
+            conn = collector.conn
+            common = {
+                "rule_id": "notification-test", "severity": "Warning", "category": "System",
+                "title": "Notification test", "summary": "Notification test", "likely_cause": "test",
+                "impact": "test", "remediation": (), "priority": 4, "unit": "test.service",
+                "details": {}, "scope": "global", "source": "test", "boot_id": "test-boot",
+            }
+            incident_id, _created = record_incident(conn, **common, occurred_us=1_000, cursor="notify-1", message="warning")
+            success = subprocess.CompletedProcess(["notify-send"], 0)
+            with patch("pcdiag_collector.time.time", side_effect=[1_000.0, 1_001.0, 1_002.0]), \
+                 patch("pcdiag_collector.subprocess.run", return_value=success) as notify:
+                collector.maybe_notify(conn, incident_id)
+                collector.maybe_notify(conn, incident_id)
+                record_incident(
+                    conn, **{**common, "severity": "Critical", "priority": 2},
+                    occurred_us=2_000, cursor="notify-2", message="critical escalation",
+                )
+                collector.maybe_notify(conn, incident_id)
+            self.assertEqual(notify.call_count, 2)
+            self.assertEqual(tuple(conn.execute("SELECT last_severity,total FROM notifications").fetchone()), ("Critical", 2))
+            command = notify.call_args_list[1].args[0]
+            self.assertTrue(any("x-canonical-private-synchronous:pc-diagnostics-" in item for item in command))
+
+            failed_id, _created = record_incident(
+                conn, **{**common, "rule_id": "notification-failure", "severity": "Warning"},
+                occurred_us=3_000, cursor="notify-failure", message="failed delivery",
+            )
+            notify.return_value = subprocess.CompletedProcess(["notify-send"], 1)
+            with patch("pcdiag_collector.time.time", return_value=1_003.0):
+                collector.maybe_notify(conn, failed_id)
+            failure_fingerprint = conn.execute(
+                "SELECT fingerprint FROM incidents WHERE id=?", (failed_id,)
+            ).fetchone()[0]
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM notifications WHERE fingerprint=?", (failure_fingerprint,)).fetchone()[0],
+                0,
+            )
+            conn.close()
+
+    def test_network_counter_reset_resolves_the_previous_network_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = Collector(Path(directory) / "events.sqlite3", once=True)
+            collector.previous_network["network.eth0.rx_errors"] = 10
+            with patch("pcdiag_collector.resolve_incident", return_value=True) as resolve:
+                collector._metric_anomalies({"network.eth0.rx_errors": 2})
+            resolve.assert_any_call(collector.conn, "network-errors", "eth0:rx_errors")
+            collector.conn.close()
+
+    def test_service_actions_reject_backslash_and_malformed_scan_versions(self) -> None:
+        with self.assertRaises(ValueError):
+            service_action_argv("restart", r"bad\name.service", "user")
+        self.assertEqual(scan_payload({"payload_version": "not-a-number"})["payload_version"], 1)
+
+    def test_notification_schema_migrates_existing_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.sqlite3"
+            legacy = sqlite3.connect(path)
+            legacy.execute(
+                "CREATE TABLE notifications (fingerprint TEXT PRIMARY KEY,last_us INTEGER NOT NULL,total INTEGER NOT NULL DEFAULT 1)"
+            )
+            legacy.commit()
+            legacy.close()
+            conn = connect_v2(path)
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(notifications)")}
+            self.assertIn("last_severity", columns)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            conn.close()
+
     def test_multi_device_sensor_and_nvidia_metrics_are_not_overwritten(self) -> None:
         sensors = parse_sensor_data({
             "nvme-pci-0100": {"Composite": {"temp1_input": 35.0}},
@@ -290,6 +409,12 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("ProtectKernelTunables=true", tuning_service.read_text(encoding="utf-8"))
         self.assertIn("pc-diagnostics-collector", collector_unit)
         self.assertNotIn("Workspace/Temp", collector_unit)
+
+    def test_source_launcher_uses_live_data_unless_isolated_requested(self) -> None:
+        launcher = (ROOT / "scripts" / "run.sh").read_text(encoding="utf-8")
+        self.assertIn('[ "${1-}" = "--isolated" ]', launcher)
+        self.assertIn('XDG_DATA_HOME="$ROOT/.data"', launcher)
+        self.assertEqual(launcher.count("XDG_DATA_HOME="), 1)
 
 
 if __name__ == "__main__":
