@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pcdiag_common import DB_PATH, run_command
+from pcdiag_common import DB_PATH, command_failed, run_command
 from pcdiag_engine import (
     RULES,
     backup_database,
@@ -705,6 +705,18 @@ class Collector:
         started = int(time.time() * 1_000_000)
         system = run_command(["systemctl", "--failed", "--no-pager", "--output=json"], 8)
         user = run_command(["systemctl", "--user", "--failed", "--no-pager", "--output=json"], 8)
+        failures = [output for output in (system, user) if command_failed(output)]
+        if failures:
+            record_scan(
+                self.conn,
+                "services",
+                "error",
+                "Unable to query failed services",
+                {"payload_version": 2, "units": [], "raw": {"system": system, "user": user}, "errors": failures},
+                started,
+            )
+            # Never resolve a real failure after an unsuccessful observation.
+            return
         failed = parse_failed_services(system, "system") + parse_failed_services(user, "user")
         details = {"payload_version": 2, "units": failed, "raw": {"system": system, "user": user}}
         record_scan(self.conn, "services", "warning" if failed else "ok", f"{len(failed)} failed services", details, started)
@@ -885,6 +897,7 @@ class Collector:
         lsblk_raw = run_command(["lsblk", "-J", "-o", "NAME,PATH,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL,TRAN,ROTA,STATE"], 8)
         lspci_raw = run_command(["lspci", "-nnk"], 8)
         lsusb_raw = run_command(["lsusb", "-t"], 8)
+        failures = [output for output in (lsblk_raw, lspci_raw, lsusb_raw) if command_failed(output)]
         try:
             blockdevices = json.loads(lsblk_raw).get("blockdevices", [])
         except (json.JSONDecodeError, AttributeError):
@@ -898,7 +911,14 @@ class Collector:
             "dmi": helper_request("dmi"),
             "raw": {"lsblk": lsblk_raw, "lspci": lspci_raw, "lsusb": lsusb_raw},
         }
-        record_scan(self.conn, "hardware", "ok", "Hardware inventory and validated sensors refreshed", details, started)
+        record_scan(
+            self.conn,
+            "hardware",
+            "error" if failures else "ok",
+            "Hardware inventory is incomplete" if failures else "Hardware inventory and validated sensors refreshed",
+            {**details, "errors": failures},
+            started,
+        )
 
     def scan_network(self) -> None:
         started = int(time.time() * 1_000_000)
@@ -906,6 +926,7 @@ class Collector:
         links_raw = run_command(["ip", "-j", "-s", "link"], 5)
         routes_raw = run_command(["ip", "-j", "route"], 5)
         listeners_raw = run_command(["ss", "-lntup"], 8)
+        failures = [output for output in (addresses_raw, links_raw, routes_raw, listeners_raw) if command_failed(output)]
         def parsed(raw: str) -> list[Any]:
             try:
                 value = json.loads(raw)
@@ -918,7 +939,14 @@ class Collector:
             "routes": parsed(routes_raw), "listeners": parse_listeners(listeners_raw),
             "raw": {"addresses": addresses_raw, "links": links_raw, "routes": routes_raw, "listeners": listeners_raw},
         }
-        record_scan(self.conn, "network", "ok", "Network interfaces and listeners refreshed", details, started)
+        record_scan(
+            self.conn,
+            "network",
+            "error" if failures else "ok",
+            "Network inventory is incomplete" if failures else "Network interfaces and listeners refreshed",
+            {**details, "errors": failures},
+            started,
+        )
 
     def scan_sysstat(self) -> None:
         started = int(time.time() * 1_000_000)
@@ -939,6 +967,7 @@ class Collector:
         package_lines = [line for line in apt.splitlines() if "/" in line and not line.startswith("Listing")]
         packages = [item for line in package_lines if (item := parse_package_upgrade(line))]
         firmware_raw = run_command(["fwupdmgr", "get-updates", "--json", "--no-unreported-check"], 45)
+        failures = [output for output in (apt, firmware_raw) if command_failed(output)]
         try:
             firmware = json.loads(firmware_raw)
         except json.JSONDecodeError:
@@ -947,8 +976,9 @@ class Collector:
             "payload_version": 2, "packages": packages, "firmware": firmware,
             "raw": {"apt": apt, "firmware": firmware_raw},
         }
-        status = "warning" if packages or bool(firmware) else "ok"
-        record_scan(self.conn, "updates", status, f"{len(packages)} packages report available upgrades", details, started)
+        status = "error" if failures else "warning" if packages or bool(firmware) else "ok"
+        summary = "Update inventory is incomplete" if failures else f"{len(packages)} packages report available upgrades"
+        record_scan(self.conn, "updates", status, summary, {**details, "errors": failures}, started)
 
     def run_due_scans(self, force: bool = False) -> None:
         schedule = (

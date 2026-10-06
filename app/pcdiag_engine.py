@@ -495,6 +495,55 @@ def open_v2(path: Path = DB_PATH, *, readonly: bool = False):
         conn.close()
 
 
+def setting_value(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    """Read a user-facing application setting without exposing SQL to the UI."""
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Persist a small UI preference in the existing private settings table."""
+    conn.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+    conn.commit()
+
+
+def clear_retained_data(conn: sqlite3.Connection, categories: set[str]) -> bool:
+    """Delete selected application-owned history while retaining preferences/checkpoints.
+
+    The collector can keep its connection open while this runs.  SQLite's
+    transaction serializes the small delete set, and source offsets are kept so
+    a cleanup cannot force an unbounded journal replay.
+    """
+    selected = set(categories)
+    if not selected:
+        return True
+    with conn:
+        if "incidents" in selected:
+            conn.execute("DELETE FROM evidence")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM notifications")
+        if "telemetry" in selected:
+            conn.execute("DELETE FROM metric_rollups")
+        if "scans" in selected:
+            conn.execute("DELETE FROM scans")
+        if "tuning" in selected:
+            conn.execute("DELETE FROM tuning_audit")
+    # VACUUM must execute outside a transaction. The deletion above is already
+    # durable, so a busy collector must not make the UI falsely report that it
+    # failed. Return whether compaction completed and let normal SQLite
+    # maintenance reclaim space if it did not.
+    try:
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except sqlite3.Error:
+        return False
+    return True
+
+
 def incident_change_token(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
     """Return a cheap token that changes for new evidence and status updates."""
     row = conn.execute(
@@ -1062,6 +1111,7 @@ def parse_sensor_data(data: dict[str, Any]) -> dict[str, dict[str, float | str]]
 
     chip_rules = (
         (re.compile(r"k10temp", re.I), re.compile(r"Tctl|Tccd", re.I), "CPU"),
+        (re.compile(r"coretemp", re.I), re.compile(r"Package id \d+|Core \d+", re.I), "CPU"),
         (re.compile(r"nvme", re.I), re.compile(r"Composite|Sensor 1", re.I), "NVMe"),
         (re.compile(r"spd5118", re.I), re.compile(r"temp1", re.I), "Memory"),
         (re.compile(r"z53", re.I), re.compile(r"Coolant", re.I), "Coolant"),
@@ -1183,22 +1233,54 @@ def parse_nvidia_metrics(output: str) -> dict[str, float]:
             continue
         try:
             gpu_id = int(values[0])
-            utilization, temperature, memory_used, memory_total, power_draw, power_limit = (
-                float(value) for value in values[1:]
-            )
         except ValueError:
-            # ``nvidia-smi`` emits N/A for unsupported sensors.  One missing
-            # row must not suppress telemetry from the other GPUs.
             continue
         prefix = "gpu" if primary_gpu else f"gpu.{gpu_id}"
         temperature_name = "temperature.NVIDIA GPU" if primary_gpu else f"temperature.NVIDIA GPU {gpu_id}"
-        metrics[f"{prefix}.percent"] = utilization
-        metrics[temperature_name] = temperature
-        metrics[f"{prefix}.memory.percent"] = 100 * memory_used / max(1, memory_total)
-        metrics[f"{prefix}.power.draw.watts"] = power_draw
-        metrics[f"{prefix}.power.limit.watts"] = power_limit
-        metrics[f"{prefix}.power.percent"] = 100 * power_draw / max(1, power_limit)
+        def number(position: int) -> float | None:
+            try:
+                return float(values[position])
+            except ValueError:
+                return None
+
+        utilization, temperature = number(1), number(2)
+        memory_used, memory_total = number(3), number(4)
+        power_draw, power_limit = number(5), number(6)
+        if utilization is not None:
+            metrics[f"{prefix}.percent"] = utilization
+        if temperature is not None:
+            metrics[temperature_name] = temperature
+        if memory_used is not None and memory_total is not None:
+            metrics[f"{prefix}.memory.percent"] = 100 * memory_used / max(1, memory_total)
+        if power_draw is not None:
+            metrics[f"{prefix}.power.draw.watts"] = power_draw
+        if power_limit is not None:
+            metrics[f"{prefix}.power.limit.watts"] = power_limit
+        if power_draw is not None and power_limit is not None:
+            metrics[f"{prefix}.power.percent"] = 100 * power_draw / max(1, power_limit)
         primary_gpu = False
+    return metrics
+
+
+def live_hardware_metrics() -> dict[str, float]:
+    """Read current validated thermal, power, and GPU values.
+
+    This may invoke external sensor tools, so callers must keep it off the UI
+    thread. The collector uses the same function when persisting telemetry.
+    """
+    metrics: dict[str, float] = {}
+    for name, item in validated_sensors().items():
+        metrics[f"temperature.{name}"] = float(item["value"])
+    for metric, item in validated_power_sensors().items():
+        metrics[metric] = float(item["value"])
+    try:
+        output = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,power.limit", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4, check=False,
+        ).stdout
+        metrics.update(parse_nvidia_metrics(output))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
     return metrics
 
 
@@ -1238,18 +1320,7 @@ def local_metrics(previous_cpu: tuple[int, int, int] | None = None) -> tuple[dic
             metrics[f"network.{interface}.tx_dropped"] = float(values[11])
     except (OSError, ValueError, IndexError):
         pass
-    for name, item in validated_sensors().items():
-        metrics[f"temperature.{name}"] = float(item["value"])
-    for metric, item in validated_power_sensors().items():
-        metrics[metric] = float(item["value"])
-    try:
-        output = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,power.limit", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4, check=False,
-        ).stdout
-        metrics.update(parse_nvidia_metrics(output))
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
+    metrics.update(live_hardware_metrics())
     return metrics, state
 
 

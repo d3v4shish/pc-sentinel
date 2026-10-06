@@ -30,6 +30,7 @@ py-modules = [
 "share/applications" = ["app/io.github.d3v.PCDiagnostics.desktop"]
 "share/metainfo" = ["app/io.github.d3v.PCDiagnostics.metainfo.xml"]
 "share/xdg/autostart" = ["app/io.github.d3v.PCDiagnostics.autostart.desktop"]
+"share/icons/hicolor/scalable/apps" = ["app/icons/hicolor/scalable/apps/io.github.d3v.PCDiagnostics.svg"]
 "share/pc-diagnostics/helpers" = [
   "app/install-helper.sh",
   "app/pcdiag_helper.py",

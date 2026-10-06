@@ -13,6 +13,7 @@
     <p>PC Diagnostics correlates local journal evidence with system health probes for systemd-based Linux workstations.</p>
   </description>
   <launchable type="desktop-id">io.github.d3v.PCDiagnostics.desktop</launchable>
+  <icon type="stock">io.github.d3v.PCDiagnostics</icon>
   <provides>
     <binary>pc-diagnostics</binary>
   </provides>

@@ -19,7 +19,6 @@ APP_ID = "io.github.d3v.PCDiagnostics"
 APP_NAME = "PC Diagnostics"
 DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "pc-diagnostics"
 DB_PATH = DATA_DIR / "events.sqlite3"
-REPORT_DIR = Path.home() / "Documents" / "PC-Diagnostic-Reports"
 PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 
@@ -133,7 +132,14 @@ def create_private_file_if_missing(path: Path) -> bool:
 
 def write_private_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
     """Write a report without relying on the caller's umask for privacy."""
-    ensure_private_directory(path.parent)
+    # A report folder can be explicitly selected by its owner. Secure an
+    # application-created folder, but never tighten an existing user folder:
+    # doing so could unexpectedly lock collaborators out of a shared export
+    # destination merely because it was selected here.
+    if path.parent == DATA_DIR or not path.parent.exists():
+        ensure_private_directory(path.parent)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE)
     try:
         with os.fdopen(descriptor, "w", encoding=encoding) as stream:
@@ -349,6 +355,11 @@ def run_command(command: list[str], timeout: float = 8.0) -> str:
         return completed.stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return f"Unable to run {' '.join(command)}: {exc}"
+
+
+def command_failed(output: str) -> bool:
+    """Identify the bounded failure string returned by :func:`run_command`."""
+    return output.startswith("Unable to run ")
 
 
 def format_time(timestamp_us: int, include_date: bool = True) -> str:

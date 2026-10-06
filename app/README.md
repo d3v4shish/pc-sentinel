@@ -4,8 +4,12 @@ PC Diagnostics is a local GTK 4 diagnostic center for systemd-based Linux
 workstations. It correlates journal evidence with validated health probes so an
 issue is shown as a diagnosis rather than an unfiltered wall of log messages.
 
-The Libadwaita interface uses adaptive navigation, health cards, history charts,
-structured hardware/service/network views, and a virtualized live-event feed.
+The Libadwaita interface follows the system appearance and native Adwaita
+typography, spacing, surfaces, and controls. Its adaptive layout is designed
+for 1080p desktops at 100% and 125% scaling, with compact resource summaries,
+a selectable resource chart, a sortable virtualized issue table, a side
+inspector, structured hardware/service/network views, and virtualized feeds
+for live events and large inventories.
 Selecting an event opens an inspector with an offline confidence-rated probable
 cause, a 250-record paginated incident timeline, nearby raw journal context, and
 exact technical metadata. Repeated messages are collapsed into 30-second bursts
@@ -34,13 +38,14 @@ Exact ten-second and one-minute telemetry is retained for seven days; compact
 - Journal evidence is followed continuously and replayed from the last stored
   timestamp after a follower restart.
 - The visible overview samples CPU, memory, swap, and root-disk use directly
-  from `/proc` once per second. These display-only samples are not written to
-  the database. The collector records health metrics every 10 seconds;
+  from `/proc` once per second and reads supported hardware sensors on its
+  background executor every 10 seconds. These display-only samples are not
+  written to the database. The collector records health metrics every 10 seconds;
   validated power, voltage, temperature, and GPU telemetry keeps exact
   ten-second samples for seven days, one-minute samples are retained for seven
   days, and 15-minute rollups for 90 days. Hardware faults, restart evidence,
   kernel failures, and crash evidence are retained for one year.
-- The visible incident page refreshes every five seconds. Performance cards
+- The visible incident page refreshes every five seconds. Performance charts
   refresh from stored telemetry every 10 seconds; service and
   helper status refresh every 30 seconds.
 - The Forensic cases view keeps a focused case for every retained restart,
@@ -115,3 +120,36 @@ those two actions use a strict unit-name and command allowlist.
 
 The GUI is also installed in Plasma's application menu and autostarts after
 login. Closing it does not stop the background collector.
+
+## Interface, settings, and local storage
+
+The welcome screen explains what PC Diagnostics does, how its background
+collector supplies evidence, and where to begin. Select **Start guided tour**
+to explore all 15 tabs in the actual interface. Each step explains the tab in
+plain language, suggests a first action, and offers a **Good to know** note
+about interpreting the data. The tour itself only navigates; it does not apply
+controls or clear data.
+
+Use **Back**, **Next tab**, or the tab picker to explore at your own pace.
+**Pause tour** saves the current tab for your next visit. Open **Guide →
+Welcome & guided tour** to continue or start again; choose **Help for this tab**
+(or press **F1**) for contextual help. Navigating the sidebar while the guide
+is open updates the explanation to match. **Explore on my own** dismisses
+onboarding without marking the tour complete. The welcome screen is shown
+once, including for users upgrading from the earlier text-only tutorial.
+
+The **Settings** section also reopens the guide, lets you choose dark, light,
+or system appearance, and shows the location of the private SQLite database
+and the report folder. Both tutorial layouts support light and dark themes;
+the welcome actions stay visible while its explanation scrolls.
+
+Settings also shows the space used by the database/WAL files, redacted reports,
+migration backups, and the bounded local application log. It can delete only
+app-owned reports, backups, and logs after confirmation. Selected retained
+diagnostic records can also be cleared transactionally; collection checkpoints
+and preferences stay in place, so the collector continues normally. It never
+deletes system journals, system crash artifacts, or files outside the folders
+shown in Settings.
+
+The packaged `io.github.d3v.PCDiagnostics` icon is an original monitor/pulse
+mark installed with the desktop entry.

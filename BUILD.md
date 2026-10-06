@@ -1,7 +1,7 @@
 # Build and run
 
 PC Diagnostics targets Python 3.11 or newer. The GUI additionally requires
-the system Python GObject bindings, GTK 4, and Libadwaita. Those system
+the system Python GObject bindings, GTK 4.10+, and Libadwaita 1.5+. Those system
 libraries are intentionally not installed by the Python package.
 
 ## Clean checkout

@@ -12,6 +12,7 @@ EXPECTED_SUFFIXES = {
     "share/applications/io.github.d3v.PCDiagnostics.desktop",
     "share/metainfo/io.github.d3v.PCDiagnostics.metainfo.xml",
     "share/xdg/autostart/io.github.d3v.PCDiagnostics.autostart.desktop",
+    "share/icons/hicolor/scalable/apps/io.github.d3v.PCDiagnostics.svg",
     "share/pc-diagnostics/helpers/install-helper.sh",
     "share/pc-diagnostics/helpers/pcdiag_helper.py",
     "share/pc-diagnostics/helpers/pcdiag_tuning_helper.py",

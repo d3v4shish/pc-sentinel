@@ -25,20 +25,26 @@ sys.path.insert(0, str(ROOT / "app"))
 import pcdiag_helper as helper
 import pcdiag_tuning_helper as tuning
 from pcdiag_collector import Collector
-from pcdiag_presenters import fetch_event_page, fetch_incident_evidence, scan_payload, service_action_argv
+from pcdiag_presenters import fetch_event_page, fetch_incident_evidence, parse_journal_json_lines, scan_payload, service_action_argv
 from pcdiag_common import write_private_text
 from pcdiag_engine import (
     acknowledge_incident,
+    clear_retained_data,
     connect_v2,
     ingest_journal_record,
     journal_timestamp_us,
+    live_hardware_metrics,
     live_overview_metrics,
     parse_nvidia_metrics,
     parse_power_sensor_data,
     parse_sensor_data,
     record_incident,
+    record_scan,
+    record_tuning_audit,
     redact,
     resolve_incident_id,
+    set_setting,
+    setting_value,
     update_metric,
 )
 
@@ -188,6 +194,61 @@ class RegressionTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(report.parent.stat().st_mode), 0o700)
             self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
 
+            shared_reports = base / "shared-reports"
+            shared_reports.mkdir(mode=0o755)
+            shared_reports.chmod(0o755)
+            shared_report = shared_reports / "report.txt"
+            write_private_text(shared_report, "private diagnostic report")
+            self.assertEqual(stat.S_IMODE(shared_reports.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(shared_report.stat().st_mode), 0o600)
+
+    def test_cleanup_reports_deferred_compaction_after_data_is_deleted(self) -> None:
+        class VacuumFailure:
+            def __init__(self, conn: sqlite3.Connection):
+                self.conn = conn
+
+            def __enter__(self):
+                self.conn.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.conn.__exit__(*args)
+
+            def execute(self, sql: str, *args):
+                if sql == "VACUUM":
+                    raise sqlite3.OperationalError("database is busy")
+                return self.conn.execute(sql, *args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect_v2(Path(directory) / "events.sqlite3")
+            record_tuning_audit(conn, "apply", {"ok": True})
+            self.assertFalse(clear_retained_data(VacuumFailure(conn), {"tuning"}))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tuning_audit").fetchone()[0], 0)
+            conn.close()
+
+    def test_journal_parser_ignores_non_object_json(self) -> None:
+        self.assertEqual(parse_journal_json_lines('[]\nnull\n"message"'), [])
+
+    def test_selected_retained_data_cleanup_keeps_preferences_and_collection_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect_v2(Path(directory) / "events.sqlite3")
+            ingest_journal_record(conn, {
+                "MESSAGE": "Kernel panic", "PRIORITY": 2,
+                "__REALTIME_TIMESTAMP": "1700000000000000", "__CURSOR": "cleanup-event",
+                "_BOOT_ID": "cleanup-boot",
+            })
+            update_metric(conn, "cpu.percent", 50, "%", timestamp_us=1_700_000_000_000_000)
+            record_scan(conn, "services", "ok", "No failed services", {"units": []})
+            record_tuning_audit(conn, "apply", {"ok": True})
+            conn.execute("INSERT INTO source_offsets(source,cursor,occurred_us) VALUES('journal','resume-here',1700000000000000)")
+            set_setting(conn, "appearance", "dark")
+            clear_retained_data(conn, {"incidents", "telemetry", "scans", "tuning"})
+            for table in ("incidents", "evidence", "metric_rollups", "scans", "tuning_audit"):
+                self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+            self.assertEqual(setting_value(conn, "appearance"), "dark")
+            self.assertEqual(conn.execute("SELECT cursor FROM source_offsets WHERE source='journal'").fetchone()[0], "resume-here")
+            conn.close()
+
     def test_incident_metadata_and_metric_last_value_follow_event_time_not_ingest_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             conn = connect_v2(Path(directory) / "events.sqlite3")
@@ -295,6 +356,16 @@ class RegressionTests(unittest.TestCase):
             service_action_argv("restart", r"bad\name.service", "user")
         self.assertEqual(scan_payload({"payload_version": "not-a-number"})["payload_version"], 1)
 
+    def test_failed_service_probe_is_not_recorded_as_a_clean_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            collector = Collector(Path(directory) / "events.sqlite3", once=True)
+            with patch("pcdiag_collector.run_command", return_value="Unable to run systemctl: timed out"), \
+                 patch("pcdiag_collector.record_scan") as record:
+                collector.scan_failed_services()
+            self.assertEqual(record.call_args.args[2], "error")
+            self.assertEqual(record.call_args.args[3], "Unable to query failed services")
+            collector.conn.close()
+
     def test_notification_schema_migrates_existing_databases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "events.sqlite3"
@@ -317,6 +388,10 @@ class RegressionTests(unittest.TestCase):
         })
         self.assertEqual(len(sensors), 2)
         self.assertEqual(sorted(item["value"] for item in sensors.values()), [35.0, 42.0])
+        intel = parse_sensor_data({
+            "coretemp-isa-0000": {"Package id 0": {"temp1_input": 60.0}},
+        })
+        self.assertEqual(list(intel.values())[0]["value"], 60.0)
 
         power = parse_power_sensor_data({
             "amdgpu-pci-0100": {"PPT": {"power1_input": 40.0}},
@@ -331,6 +406,25 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(nvidia["gpu.percent"], 10.0)
         self.assertEqual(nvidia["gpu.1.percent"], 20.0)
         self.assertEqual(nvidia["gpu.1.power.draw.watts"], 50.0)
+        partial = parse_nvidia_metrics("0, 25, 60, 500, 4000, N/A, N/A\n")
+        self.assertEqual(partial["gpu.percent"], 25.0)
+        self.assertEqual(partial["temperature.NVIDIA GPU"], 60.0)
+        self.assertNotIn("gpu.power.draw.watts", partial)
+
+    def test_live_hardware_metrics_combines_validated_sensor_and_gpu_data(self) -> None:
+        nvidia = SimpleNamespace(stdout="0, 25, 60, 500, 4000, 40, 200\n")
+        with patch("pcdiag_engine.validated_sensors", return_value={
+            "CPU Tctl": {"value": 72.5},
+            "AMD iGPU edge": {"value": 61.0},
+        }), patch("pcdiag_engine.validated_power_sensors", return_value={
+            "power.AMD graphics PPT.watts": {"value": 35.0},
+        }), patch("pcdiag_engine.subprocess.run", return_value=nvidia):
+            metrics = live_hardware_metrics()
+        self.assertEqual(metrics["temperature.CPU Tctl"], 72.5)
+        self.assertEqual(metrics["temperature.AMD iGPU edge"], 61.0)
+        self.assertEqual(metrics["power.AMD graphics PPT.watts"], 35.0)
+        self.assertEqual(metrics["gpu.percent"], 25.0)
+        self.assertEqual(metrics["gpu.power.draw.watts"], 40.0)
 
     def test_tuning_apply_and_restore_take_the_process_lock(self) -> None:
         with patch.object(tuning, "exclusive_tuning_lock", return_value=nullcontext()) as lock, \
@@ -400,6 +494,9 @@ class RegressionTests(unittest.TestCase):
 
     def test_deployment_assets_include_opt_in_tuning_and_portable_collector_path(self) -> None:
         installer = (ROOT / "app" / "install-helper.sh").read_text(encoding="utf-8")
+        desktop = (ROOT / "app" / "io.github.d3v.PCDiagnostics.desktop").read_text(encoding="utf-8")
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        icon = ROOT / "app" / "icons" / "hicolor" / "scalable" / "apps" / "io.github.d3v.PCDiagnostics.svg"
         tuning_socket = ROOT / "app" / "pc-diagnostics-tuning.socket.in"
         tuning_service = ROOT / "app" / "pc-diagnostics-tuning@.service"
         collector_unit = (ROOT / "systemd" / "pc-diagnostics-collector.service.example").read_text(encoding="utf-8")
@@ -409,6 +506,9 @@ class RegressionTests(unittest.TestCase):
         self.assertIn("ProtectKernelTunables=true", tuning_service.read_text(encoding="utf-8"))
         self.assertIn("pc-diagnostics-collector", collector_unit)
         self.assertNotIn("Workspace/Temp", collector_unit)
+        self.assertTrue(icon.is_file())
+        self.assertIn("Icon=io.github.d3v.PCDiagnostics", desktop)
+        self.assertIn(str(icon.relative_to(ROOT)), pyproject)
 
     def test_source_launcher_uses_live_data_unless_isolated_requested(self) -> None:
         launcher = (ROOT / "scripts" / "run.sh").read_text(encoding="utf-8")

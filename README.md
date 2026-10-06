@@ -22,8 +22,8 @@ empty until a collector samples the host:
 XDG_DATA_HOME="$PWD/.data" PYTHONDONTWRITEBYTECODE=1 python3 app/pcdiag_collector.py --once
 ```
 
-The GTK GUI depends on the system-provided Python GObject bindings and GTK 4 /
-Libadwaita. They are intentionally not declared as PyPI dependencies.
+The GTK GUI depends on the system-provided Python GObject bindings, GTK 4.10+
+and Libadwaita 1.5+. They are intentionally not declared as PyPI dependencies.
 
 ## Release checks
 
@@ -37,6 +37,12 @@ Run the dependency-free regression suite as well:
 
 ```sh
 PYTHONPATH=app PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+```
+
+On a graphical desktop, run the adaptive GTK geometry check with:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 GSK_RENDERER=gl python3 tests/ui_layout_smoke.py
 ```
 
 Build tooling is not required for normal use, but a release wheel should also

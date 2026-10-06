@@ -207,6 +207,8 @@ def parse_journal_json_lines(output: str) -> list[dict[str, Any]]:
             item = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(item, dict):
+            continue
         try:
             stamp = int(item.get("__REALTIME_TIMESTAMP", 0))
             priority = int(item.get("PRIORITY", 6))
